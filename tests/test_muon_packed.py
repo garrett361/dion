@@ -1,6 +1,10 @@
+import gc
+import weakref
+
 import torch
 from torch._dynamo.eval_frame import _debug_get_cache_entry_list
 
+from dion import Muon
 from dion.muon import (
     muon_update_post_orthogonalize,
     muon_update_post_orthogonalize_packed,
@@ -44,6 +48,22 @@ def test_plan_balances_owners_by_newton_schulz_cost():
     assert plan.owners[0] == 0
     assert set(plan.owners[1:]) == {1}
     assert plan.owned_by(2) == ()
+
+
+def test_plan_cache_neither_keeps_tensors_alive_nor_reuses_plans_of_dead_ones():
+    kept = torch.nn.Parameter(torch.zeros(8, 4))
+    muon = Muon(params=[kept], fsdp_mesh_dim=0, world_mesh=None)
+    params = [torch.nn.Parameter(torch.zeros(8, 4))]
+    plan = muon._get_packed_plan(params, [0], [None], world_size=2)
+    assert muon._get_packed_plan(params, [0], [None], world_size=2) is plan
+    dead = weakref.ref(params[0])
+    del params
+    gc.collect()
+    assert dead() is None
+    replacement = [torch.nn.Parameter(torch.zeros(6, 4))]
+    replacement_plan = muon._get_packed_plan(replacement, [0], [None], world_size=2)
+    assert replacement_plan.shard_sizes == ((3, 3),)
+    assert len(muon._packed_plans) == 1
 
 
 def test_packed_updates_compile_few_graphs_for_many_shapes():

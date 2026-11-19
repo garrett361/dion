@@ -1,5 +1,6 @@
 import math
 import torch
+import weakref
 import torch.distributed as dist
 from itertools import chain
 from torch import Tensor
@@ -182,7 +183,7 @@ class Muon(Optimizer):
             )
 
         self._matrix_shard_dims: Dict[tuple, Tuple[Optional[int], bool]] = {}
-        self._packed_plans: Dict[tuple, Tuple[Tuple[Tensor, ...], PackedPlan]] = {}
+        self._packed_plans: Dict[tuple, Tuple[Tuple[weakref.ref, ...], PackedPlan]] = {}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -395,11 +396,18 @@ class Muon(Optimizer):
     ) -> PackedPlan:
         """
         The cached owner plan of a bucket, rebuilt unless it was made for these very tensors.
+        The cache holds weak references, so it neither keeps tensors alive nor trusts a reused id.
         """
         key = (tuple(id(p) for p in params), world_size)
         cached = self._packed_plans.get(key)
-        if cached is None or any(a is not b for a, b in zip(cached[0], params)):
-            cached = (tuple(params), make_plan(params, shard_dims, partitions, world_size))
+        if cached is None or any(ref() is not p for ref, p in zip(cached[0], params)):
+            self._packed_plans = {
+                k: v for k, v in self._packed_plans.items() if all(ref() is not None for ref in v[0])
+            }
+            cached = (
+                tuple(weakref.ref(p) for p in params),
+                make_plan(params, shard_dims, partitions, world_size),
+            )
             self._packed_plans[key] = cached
         return cached[1]
 
