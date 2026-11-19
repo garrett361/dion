@@ -17,6 +17,8 @@ from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 import dion.muon_packed
 from dion import Muon
 from dion.muon import zeropower_via_newtonschulz5
+from dion.muon_packed import chunk_sizes
+from dion.newton_schulz_triton import newton_schulz_triton
 
 if "RANK" not in os.environ:
     pytest.skip("requires torchrun", allow_module_level=True)
@@ -67,10 +69,10 @@ MATRICES = [matrix for _, matrices in GROUPS for matrix in matrices]
 PACKED_MATRICES = 28
 
 
-def make_parameters(mesh):
+def make_parameters(mesh, matrices=MATRICES):
     generator = torch.Generator().manual_seed(0)
     params = []
-    for shape, shard_dim, _, dtype in MATRICES:
+    for shape, shard_dim, _, dtype in matrices:
         placement = Replicate() if shard_dim is None else Shard(shard_dim)
         placements = [Replicate()] * (mesh.ndim - 1) + [placement]
         full = torch.randn(shape, generator=generator).to(device="cuda", dtype=dtype)
@@ -196,3 +198,128 @@ def test_packed_tolerates_float32_newton_schulz(world_size, monkeypatch):
 
     for packed, batched in zip(train(True), train(False)):
         torch.testing.assert_close(packed, batched, rtol=1e-2, atol=1e-3)
+
+
+# (shape, shard dim, partitions, dtype): packed matrices, head-partitioned ones, and 3-D tensors
+# sharded on the expert dim, so every rank holds whole matrices of its own
+BATCHING_MATRICES = [
+    ((32, 16), 0, None, torch.float32),
+    ((16, 32), 0, None, torch.float32),
+    ((64, 32), 0, (16, 16, 16, 16), torch.float32),
+    ((80, 16), 0, (32, 48), torch.float32),
+    ((4, 16, 32), 0, None, torch.float32),
+    ((4, 16, 32), 0, None, torch.float32),
+    ((5, 16, 32), 0, None, torch.float32),
+    ((6, 32, 16), 0, None, torch.float32),
+    ((4, 32, 32), 0, (16, 16), torch.float32),
+    ((4, 64, 16), 0, (32, 32), torch.float32),
+    ((4, 80, 16), 0, (32, 48), torch.float32),
+    ((128, 16, 32), 0, None, torch.float32),
+]
+BATCHING_TOLERANCE = 0.04
+
+
+def counted(newton_schulz_func, calls):
+    def run(X, epsilon):
+        calls.append(X.shape)
+        return newton_schulz_func(X, epsilon=epsilon)
+
+    return run
+
+
+def per_matrix(newton_schulz_func):
+    def run(X, epsilon):
+        if X.ndim == 2:
+            return newton_schulz_func(X, epsilon=epsilon)
+        return torch.stack([newton_schulz_func(x, epsilon=epsilon) for x in X])
+
+    return run
+
+
+def unbatched_calls(world_size):
+    """
+    Newton-Schulz calls of one call per matrix tensor and partition, summed over ranks.
+    """
+    total = 0
+    for shape, _, parts, _ in BATCHING_MATRICES:
+        pieces = len(parts) if parts is not None else 1
+        if len(shape) == 2:
+            total += pieces
+        else:
+            total += pieces * sum(1 for size in chunk_sizes(shape[0], world_size) if size)
+    return total
+
+
+def make_batching_muon(params, mesh, newton_schulz_func):
+    return Muon(
+        params=params,
+        matrix_partitions={
+            p: parts
+            for p, (_, _, parts, _) in zip(params, BATCHING_MATRICES)
+            if parts is not None
+        },
+        lr=0.02,
+        mu=0.95,
+        nesterov=True,
+        weight_decay=0.1,
+        adjust_lr="rms_norm",
+        distributed_mesh=mesh,
+        world_mesh=mesh,
+        fsdp_mesh_dim=0,
+        newton_schulz_func=newton_schulz_func,
+    )
+
+
+@pytest.mark.parametrize("newton_schulz", ["reference", "triton"])
+def test_batched_newton_schulz_matches_per_matrix_reference(world_size, newton_schulz):
+    """
+    Batching the equal row blocks of a partitioned matrix, and the whole matrices each rank
+    holds across tensors (including blocks taller than wide, which Triton returns transposed),
+    makes fewer Newton-Schulz calls than one per matrix tensor and partition. Against eager
+    reference Newton-Schulz run one matrix at a time on the batched path, after three steps
+    the momentum is bitwise equal, the weights too with the eager reference batched, and every
+    weight update is within BATCHING_TOLERANCE relative norm with Triton.
+    """
+    mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_shard",))
+    reference_params = make_parameters(mesh, BATCHING_MATRICES)
+    batched_params = make_parameters(mesh, BATCHING_MATRICES)
+    start = [p.detach().to_local().clone() for p in reference_params]
+    eager = zeropower_via_newtonschulz5._torchdynamo_orig_callable
+    reference_calls, batched_calls = [], []
+    reference = make_batching_muon(
+        reference_params, mesh, counted(per_matrix(eager), reference_calls)
+    )
+    reference._pack_sharded_matrices = False
+    batched_func = newton_schulz_triton if newton_schulz == "triton" else eager
+    batched = make_batching_muon(batched_params, mesh, counted(batched_func, batched_calls))
+
+    generator = torch.Generator().manual_seed(1)
+    for _ in range(3):
+        for reference_param, batched_param in zip(reference_params, batched_params):
+            grad = torch.randn(reference_param.shape, generator=generator).cuda()
+            reference_param.grad = distribute_tensor(grad, mesh, reference_param.placements)
+            batched_param.grad = distribute_tensor(grad, mesh, batched_param.placements)
+        reference.step()
+        batched.step()
+
+    for reference_param, batched_param, before in zip(reference_params, batched_params, start):
+        torch.testing.assert_close(
+            batched.state[batched_param]["momentum"].to_local(),
+            reference.state[reference_param]["momentum"].to_local(),
+            rtol=0,
+            atol=0,
+        )
+        if newton_schulz == "reference":
+            torch.testing.assert_close(
+                batched_param.to_local(), reference_param.to_local(), rtol=0, atol=0
+            )
+            continue
+        reference_update = reference_param.to_local() - before
+        batched_update = batched_param.to_local() - before
+        assert (batched_update - reference_update).norm() <= (
+            BATCHING_TOLERANCE * reference_update.norm()
+        )
+
+    calls = torch.tensor([len(batched_calls)], device="cuda")
+    dist.all_reduce(calls)
+    assert calls.item() < 3 * unbatched_calls(world_size)

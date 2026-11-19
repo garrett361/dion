@@ -333,10 +333,10 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     return X
 
 
-@torch.compile(dynamic=False, fullgraph=True)
 def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
     """
-    Triton implementation of Newton-Schulz iteration
+    Triton implementation of Newton-Schulz iteration. Not compiled: the kernels need no graph,
+    and a compiled wrapper would compile one graph per input shape.
     """
     # Newton-Schulz constants
     ns_consts = [

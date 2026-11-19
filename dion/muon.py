@@ -34,6 +34,9 @@ from .scalar_opts import (
     adamw_update_foreach,
 )
 
+# Most matrices that one Newton-Schulz call batches across tensors
+NEWTON_SCHULZ_BATCH = 32
+
 
 class Muon(Optimizer):
     """
@@ -58,7 +61,8 @@ class Muon(Optimizer):
         flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
             True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
-        use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
+        use_triton: Whether to use Triton kernels for Newton-Schulz on CUDA tensors instead of the
+            compiled PyTorch iteration. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is `func(input: Tensor, epsilon: float) -> Tensor`.
         matrix_partitions: Maps a parameter to the sizes of the independent matrices packed
@@ -87,7 +91,7 @@ class Muon(Optimizer):
         nesterov: bool = False,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
-        use_triton: bool = False,
+        use_triton: bool = True,
         newton_schulz_func: Optional[Callable] = None,
         matrix_partitions: Optional[Mapping[Tensor, Sequence[int]]] = None,
     ):
@@ -154,7 +158,7 @@ class Muon(Optimizer):
                 )
             self._newton_schulz_func = newton_schulz_func
         elif use_triton:
-            self._newton_schulz_func = newton_schulz_triton
+            self._newton_schulz_func = newton_schulz_triton_on_cuda
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
 
@@ -640,18 +644,12 @@ def muon_update_batch_async(
     if is_local:
         # Local shards are already whole matrices that differ across devices, so each
         # device orthogonalizes its own without communication
-        U = [
-            u
-            if u.numel() == 0
-            else muon_orthogonalize_update(
-                u,
-                partitions=partitions,
-                newton_schulz_func=newton_schulz_func,
-                flatten=flatten,
-                epsilon=epsilon,
-            )
-            for u in U
-        ]
+        U = muon_orthogonalize_local_batch(
+            U,
+            partitions=partitions,
+            newton_schulz_func=newton_schulz_func,
+            epsilon=epsilon,
+        )
 
     elif shard_dim is not None:
         # Use all-to-all to transform from a batch of shards to a single whole matrix
@@ -1122,16 +1120,20 @@ def muon_orthogonalize_update(
 
     Without partitions this is a single Newton-Schulz over the whole tensor. With
     partitions, X packs several independent matrices along dimension -2, and each one
-    is orthogonalized on its own.
+    is orthogonalized on its own; equal partitions share one batched call.
     """
-    if partitions is None:
+    if partitions is None or len(partitions) == 1:
         return muon_update_newton_schulz(
             X, newton_schulz_func=newton_schulz_func, flatten=flatten, epsilon=epsilon
         )
 
-    # TODO: when every partition has the same size, the packed rows reshape to
-    # [num_partitions, partition_size, fan_in] and Newton-Schulz runs once on the whole
-    # batch instead of once per partition. Worth doing when something fuses per-head Q/K/V.
+    if len(set(partitions)) == 1 and not (flatten and X.ndim >= 3):
+        # Equal partitions are a batch of matrices, orthogonalized in one call
+        blocks = X.unflatten(-2, (len(partitions), partitions[0]))
+        return muon_update_newton_schulz(
+            blocks, newton_schulz_func=newton_schulz_func, flatten=False, epsilon=epsilon
+        ).reshape(X.shape)
+
     updates = [
         # Newton-Schulz reads the partition many times, so pay for one contiguous copy
         muon_update_newton_schulz(
@@ -1143,6 +1145,59 @@ def muon_orthogonalize_update(
         for partition in torch.split(X, partitions, dim=-2)
     ]
     return torch.cat(updates, dim=-2)
+
+
+def muon_orthogonalize_local_batch(
+    U: List[Tensor],
+    partitions: Optional[Tuple[int, ...]],
+    newton_schulz_func: Callable,
+    epsilon: Tensor,
+) -> List[Tensor]:
+    """
+    Orthogonalize same-shape tensors of whole matrices, e.g. each device's experts.
+
+    The matrices of tensors holding fewer than NEWTON_SCHULZ_BATCH matrices share
+    Newton-Schulz calls of up to that many matrices; a larger tensor is one call of its own.
+    Equal partitions count as matrices of their own.
+    """
+    if partitions is not None and len(set(partitions)) > 1:
+        return [
+            u
+            if u.numel() == 0
+            else muon_orthogonalize_update(
+                u,
+                partitions=partitions,
+                newton_schulz_func=newton_schulz_func,
+                flatten=False,
+                epsilon=epsilon,
+            )
+            for u in U
+        ]
+
+    rows = U[0].size(-2) if partitions is None else partitions[0]
+    stacks = {index: u.reshape(-1, rows, u.size(-1)) for index, u in enumerate(U) if u.numel()}
+    calls: List[List[int]] = []
+    count = 0
+    for index, stack in stacks.items():
+        if not calls or count + stack.size(0) > NEWTON_SCHULZ_BATCH:
+            calls.append([])
+            count = 0
+        calls[-1].append(index)
+        count += stack.size(0)
+
+    U = list(U)
+    for indices in calls:
+        batch = [stacks[index] for index in indices]
+        result = muon_update_newton_schulz(
+            torch.cat(batch) if len(batch) > 1 else batch[0],
+            newton_schulz_func=newton_schulz_func,
+            flatten=False,
+            epsilon=epsilon,
+        )
+        # Triton returns tall matrices transposed, so reshape rather than view
+        for index, piece in zip(indices, torch.split(result, [b.size(0) for b in batch])):
+            U[index] = piece.reshape(U[index].shape)
+    return U
 
 
 def partition_row_learning_rates(
@@ -1203,6 +1258,15 @@ def adjust_lr_keller_muon(lr, param_shape):
     fan_out, fan_in = param_shape[-2:] # need -2: instead of 2: because it would break experts params that are 3d
     adjusted_lr = lr * max(1, fan_out / fan_in)**0.5
     return adjusted_lr
+
+def newton_schulz_triton_on_cuda(G: Tensor, epsilon: float = 1e-7) -> Tensor:
+    """
+    Triton Newton-Schulz for CUDA tensors, the compiled PyTorch iteration for others.
+    """
+    if G.is_cuda:
+        return newton_schulz_triton(G, epsilon=epsilon)
+    return zeropower_via_newtonschulz5(G, epsilon=epsilon)
+
 
 @torch.compile(fullgraph=True)
 def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
