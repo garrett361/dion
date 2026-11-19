@@ -67,7 +67,7 @@ def test_packed_updates_compile_few_graphs_for_many_shapes():
     with torch._dynamo.config.patch(recompile_limit=64):
         for _ in range(3):
             U = muon_update_pre_orthogonalize_packed(
-                [torch.randn_like(x) for x in X], M, momentum, nesterov=True
+                [torch.randn_like(x) for x in X], M, momentum, nesterov=True, length=16
             )
             returned = torch.cat([u.reshape(-1) for u in U])
             updates = [
@@ -75,7 +75,7 @@ def test_packed_updates_compile_few_graphs_for_many_shapes():
                 for piece, u in zip(torch.split(returned, [u.numel() for u in U]), U)
             ]
             muon_update_post_orthogonalize_packed(
-                X, updates, partitions, lr, weight_decay, "rms_norm", [None] * len(X)
+                X, updates, partitions, lr, weight_decay, "rms_norm", [None] * len(X), 16
             )
     functions = (
         muon_update_pre_orthogonalize,

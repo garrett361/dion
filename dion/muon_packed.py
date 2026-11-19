@@ -3,8 +3,8 @@ Plan for Muon on FSDP-sharded matrices with every whole matrix on one owner rank
 
 Batches of one matrix per rank, padded with dummy matrices to the shard group size, cost host
 work and traffic in proportion to the group size. Instead, each matrix goes to one owner rank
-(balanced by Newton-Schulz cost): one all-to-all brings every owner the shards of its matrices
-and one brings the orthogonalized shards back. Each matrix runs the same momentum update,
+(balanced by Newton-Schulz cost): per bucket of matrices of bounded size, one all-to-all brings
+every owner the shards of its matrices and one brings the orthogonalized shards back. Each matrix runs the same momentum update,
 Newton-Schulz and weight update as in a batch, so with eager Newton-Schulz the updates are
 bitwise those of the batched path.
 """
@@ -15,9 +15,10 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from functools import cached_property
 from torch import Tensor
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 FOREACH_CHUNK = 16
+EXCHANGE_MATRICES_PER_RANK = 1
 
 
 @dataclass(frozen=True)
@@ -91,20 +92,55 @@ def make_plan(
     )
 
 
-def foreach_chunks(indices: List[int]) -> List[List[int]]:
+def exchange_buckets(
+    params: Sequence[Tensor], keys: Sequence[tuple], world_size: int
+) -> List[List[int]]:
     """
-    `indices` cut into lists of at most FOREACH_CHUNK entries.
+    Indices of `params` grouped by `keys` (in order of first appearance) and cut into buckets
+    of at most EXCHANGE_MATRICES_PER_RANK times `world_size` of the largest matrix's elements
+    (or one matrix, if larger), so the buffers of one exchange stay bounded like those of a
+    batch of one matrix per rank, and lists of one shape stay long.
     """
-    return [indices[start : start + FOREACH_CHUNK] for start in range(0, len(indices), FOREACH_CHUNK)]
+    if not params:
+        return []
+    by_key: Dict[tuple, List[int]] = {}
+    for index, key in enumerate(keys):
+        by_key.setdefault(key, []).append(index)
+    capacity = EXCHANGE_MATRICES_PER_RANK * world_size * max(p.numel() for p in params)
+    buckets, size = [[]], 0
+    for index in (index for indices in by_key.values() for index in indices):
+        numel = params[index].numel()
+        if buckets[-1] and size + numel > capacity:
+            buckets.append([])
+            size = 0
+        buckets[-1].append(index)
+        size += numel
+    return buckets
 
 
-def pad_list(tensors: List[Tensor]) -> List[Tensor]:
+def foreach_length(world_size: int) -> int:
     """
-    `tensors`, all of one shape and dtype, filled up to FOREACH_CHUNK entries with fresh
+    Length of the fixed-length lists given to compiled list functions: the shard group size,
+    like a batch of one matrix per rank, but at most FOREACH_CHUNK, so the compiled graphs do
+    not grow with the number of ranks.
+    """
+    return min(FOREACH_CHUNK, world_size)
+
+
+def foreach_chunks(indices: List[int], length: int) -> List[List[int]]:
+    """
+    `indices` cut into lists of at most `length` entries.
+    """
+    return [indices[start : start + length] for start in range(0, len(indices), length)]
+
+
+def pad_list(tensors: List[Tensor], length: int) -> List[Tensor]:
+    """
+    `tensors`, all of one shape and dtype, filled up to `length` entries with fresh
     uninitialized tensors like the first, so compiled list functions see lists of one length
     and one shape whatever the number of real entries.
     """
-    return tensors + [torch.empty_like(tensors[0]) for _ in range(FOREACH_CHUNK - len(tensors))]
+    return tensors + [torch.empty_like(tensors[0]) for _ in range(length - len(tensors))]
 
 
 def own_storage(tensor: Tensor) -> Tensor:

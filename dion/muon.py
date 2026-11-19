@@ -11,7 +11,9 @@ from typing import Callable, Dict, Generator, List, Mapping, Optional, Sequence,
 
 from .muon_packed import (
     PackedPlan,
+    exchange_buckets,
     foreach_chunks,
+    foreach_length,
     make_plan,
     own_storage,
     pad_dim,
@@ -299,18 +301,25 @@ class Muon(Optimizer):
             packed, shard_dims, group_params = self._split_packed_params(
                 group_params, flatten, world_size, process_group, distributed_mesh
             )
-            if packed:
-                partitions = [self._matrix_partitions.get(p) for p in packed]
-                plan_key = (tuple(id(p) for p in packed), world_size)
+            # Each bucket of sharded matrices is exchanged on its own, so the runtime
+            # overlaps one bucket's communication with another's Newton-Schulz
+            keys = [
+                (p.shape, p.dtype, shard_dim, self._matrix_partitions.get(p))
+                for p, shard_dim in zip(packed, shard_dims)
+            ]
+            for bucket in exchange_buckets(packed, keys, world_size):
+                params = [packed[i] for i in bucket]
+                partitions = [self._matrix_partitions.get(p) for p in params]
+                plan_key = (tuple(id(p) for p in params), world_size)
                 if plan_key not in self._packed_plans:
                     self._packed_plans[plan_key] = make_plan(
-                        packed, shard_dims, partitions, world_size
+                        params, [shard_dims[i] for i in bucket], partitions, world_size
                     )
                 yield AsyncTask(
                     muon_update_packed_async(
-                        X=packed,
-                        G=[p.grad for p in packed],
-                        M=[self._get_or_initialize_state(p, algo_name)["momentum"] for p in packed],
+                        X=params,
+                        G=[p.grad for p in params],
+                        M=[self._get_or_initialize_state(p, algo_name)["momentum"] for p in params],
                         plan=self._packed_plans[plan_key],
                         partitions=partitions,
                         lr=lr,
@@ -772,7 +781,8 @@ def muon_update_packed_async(
     whole by its owner rank. One all-to-all sends every owner the shards of its matrices
     and one sends the orthogonalized shards back.
     """
-    U = muon_update_pre_orthogonalize_packed(G, M, momentum, nesterov)
+    length = foreach_length(world_size)
+    U = muon_update_pre_orthogonalize_packed(G, M, momentum, nesterov, length)
     owned = plan.owned_by(device_rank)
     by_owner = [plan.owned_by(rank) for rank in range(world_size)]
 
@@ -861,7 +871,7 @@ def muon_update_packed_async(
         start = min(device_rank * padded, x.size(-2))
         row_slices.append((start, min(padded, x.size(-2) - start)))
     muon_update_post_orthogonalize_packed(
-        X, updates, partitions, lr, weight_decay, adjust_lr, row_slices
+        X, updates, partitions, lr, weight_decay, adjust_lr, row_slices, length
     )
 
 
@@ -870,9 +880,11 @@ def muon_update_pre_orthogonalize_packed(
     M: List[Tensor],
     momentum: Tensor,
     nesterov: bool,
+    length: int,
 ) -> List[Tensor]:
     """
-    muon_update_pre_orthogonalize on local shards, in fixed-length lists of one shape and dtype each.
+    muon_update_pre_orthogonalize on local shards, in lists of `length` entries of one shape
+    and dtype each.
     """
     local_grads, local_momentums = to_local(G), to_local(M)
     lists: Dict[tuple, List[int]] = {}
@@ -881,10 +893,10 @@ def muon_update_pre_orthogonalize_packed(
         lists.setdefault(key, []).append(index)
     U: List[Optional[Tensor]] = [None] * len(local_grads)
     for indices in lists.values():
-        for chunk in foreach_chunks(indices):
+        for chunk in foreach_chunks(indices, length):
             outputs = muon_update_pre_orthogonalize(
-                G=pad_list([own_storage(local_grads[index]) for index in chunk]),
-                M=pad_list([local_momentums[index] for index in chunk]),
+                G=pad_list([own_storage(local_grads[index]) for index in chunk], length),
+                M=pad_list([local_momentums[index] for index in chunk], length),
                 momentum=momentum,
                 nesterov=nesterov,
             )
@@ -901,11 +913,12 @@ def muon_update_post_orthogonalize_packed(
     weight_decay: Tensor,
     adjust_lr: Optional[str],
     row_slices: List[Optional[Tuple[int, int]]],
+    length: int,
 ):
     """
-    The weight update of every matrix, in fixed-length lists of one local shape, learning rate
-    and dtype. `row_slices` gives the (start, length) of this rank's rows of each partitioned
-    matrix sharded on dim -2.
+    The weight update of every matrix, in lists of `length` entries of one local shape,
+    learning rate and dtype. `row_slices` gives the (start, length) of this rank's rows of
+    each partitioned matrix sharded on dim -2.
     """
     plain: Dict[tuple, List[int]] = {}
     partitioned: Dict[tuple, List[int]] = {}
@@ -926,19 +939,19 @@ def muon_update_post_orthogonalize_packed(
 
     for (shape, _, _), indices in plain.items():
         adjusted_lr = adjust_lr_for_shape(lr, torch.Size(shape), adjust_lr)
-        for chunk in foreach_chunks(indices):
+        for chunk in foreach_chunks(indices, length):
             muon_update_post_orthogonalize(
-                X=pad_list([to_local(X[index]) for index in chunk]),
-                U=pad_list([own_storage(updates[index]) for index in chunk]),
+                X=pad_list([to_local(X[index]) for index in chunk], length),
+                U=pad_list([own_storage(updates[index]) for index in chunk], length),
                 base_lr=lr,
                 adjusted_lr=adjusted_lr,
                 weight_decay=weight_decay,
             )
     for (lr_key, _, _), indices in partitioned.items():
-        for chunk in foreach_chunks(indices):
+        for chunk in foreach_chunks(indices, length):
             muon_update_post_orthogonalize_partitioned(
-                X=pad_list([to_local(X[index]) for index in chunk]),
-                U=pad_list([own_storage(updates[index]) for index in chunk]),
+                X=pad_list([to_local(X[index]) for index in chunk], length),
+                U=pad_list([own_storage(updates[index]) for index in chunk], length),
                 base_lr=lr,
                 row_lr=row_lrs[lr_key],
                 weight_decay=weight_decay,

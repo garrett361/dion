@@ -14,6 +14,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
+import dion.muon_packed
 from dion import Muon
 from dion.muon import zeropower_via_newtonschulz5
 
@@ -63,7 +64,7 @@ GROUPS = [
     (dict(lr=0.04), [((10, 12), 0, None, torch.float32)]),
 ]
 MATRICES = [matrix for _, matrices in GROUPS for matrix in matrices]
-PACKED_PER_GROUP = [6, 4, 17, 1]
+PACKED_MATRICES = 28
 
 
 def make_parameters(mesh):
@@ -99,16 +100,18 @@ def make_eager_muon(params, mesh):
     )
 
 
+@pytest.mark.parametrize("matrices_per_rank", [1, 1000])
 @pytest.mark.parametrize("replicas", [None, 1, 2])
-def test_packed_matches_batched_bitwise(world_size, replicas, monkeypatch):
+def test_packed_matches_batched_bitwise(world_size, replicas, matrices_per_rank, monkeypatch):
     """
     With eager Newton-Schulz, packing whole matrices onto owner ranks gives the batched path's
     weights and momentum bitwise: uneven and empty shards, per-head partitioned rows split
     across shards, a column-sharded partitioned matrix, several shape, dtype and parameter
     groups, more matrices of one shape than one fixed-length list holds, a rank owning
     nothing, next to expert-like and replicated matrices left on the batched path, on FSDP
-    and HSDP meshes.
+    and HSDP meshes, with small exchange buckets and with one bucket per group.
     """
+    monkeypatch.setattr(dion.muon_packed, "EXCHANGE_MATRICES_PER_RANK", matrices_per_rank)
     if replicas is None:
         mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_shard",))
     else:
@@ -135,9 +138,7 @@ def test_packed_matches_batched_bitwise(world_size, replicas, monkeypatch):
         packed.step()
         batched.step()
 
-    assert sorted(len(plan.owners) for plan in packed._packed_plans.values()) == sorted(
-        PACKED_PER_GROUP
-    )
+    assert sum(len(plan.owners) for plan in packed._packed_plans.values()) == PACKED_MATRICES
     assert not batched._packed_plans
     for packed_param, batched_param, before in zip(packed_params, batched_params, start):
         assert set(packed.state[packed_param]) == set(batched.state[batched_param]) == {"momentum"}
