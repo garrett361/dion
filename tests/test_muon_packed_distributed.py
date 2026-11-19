@@ -168,19 +168,31 @@ def test_packed_tolerates_float32_newton_schulz(world_size, monkeypatch):
     batched path, which applies the float32 result.
     """
     mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_shard",))
-    packed_params, batched_params = make_parameters(mesh), make_parameters(mesh)
-    packed = make_eager_muon(packed_params, mesh, float32_newton_schulz)
-    batched = make_eager_muon(batched_params, mesh, float32_newton_schulz)
-    monkeypatch.setattr(batched, "_pack_sharded_matrices", False)
-    generator = torch.Generator().manual_seed(1)
-    for packed_param, batched_param in zip(packed_params, batched_params):
-        grad = torch.randn(packed_param.shape, generator=generator)
-        grad = grad.to(device="cuda", dtype=packed_param.dtype)
-        packed_param.grad = distribute_tensor(grad, mesh, packed_param.placements)
-        batched_param.grad = distribute_tensor(grad, mesh, batched_param.placements)
-    packed.step()
-    batched.step()
-    for packed_param, batched_param in zip(packed_params, batched_params):
-        torch.testing.assert_close(
-            packed_param.to_local(), batched_param.to_local(), rtol=1e-2, atol=1e-3
+    generator = torch.Generator().manual_seed(0)
+    shapes = [(7, 12), (1, 8), (16, 32), (16, 32), (12, 9)]
+    weights = [torch.randn(shape, generator=generator).cuda() for shape in shapes]
+    grads = [torch.randn(shape, generator=generator).cuda() for shape in shapes]
+
+    def train(pack):
+        params = [
+            torch.nn.Parameter(distribute_tensor(w.clone(), mesh, [Shard(0)])) for w in weights
+        ]
+        muon = Muon(
+            params=[dict(params=params)],
+            lr=0.02,
+            mu=0.95,
+            weight_decay=0.1,
+            adjust_lr="rms_norm",
+            distributed_mesh=mesh,
+            world_mesh=mesh,
+            fsdp_mesh_dim=0,
+            newton_schulz_func=float32_newton_schulz,
         )
+        monkeypatch.setattr(muon, "_pack_sharded_matrices", pack)
+        for p, g in zip(params, grads):
+            p.grad = distribute_tensor(g, mesh, [Shard(0)])
+        muon.step()
+        return [p.to_local() for p in params]
+
+    for packed, batched in zip(train(True), train(False)):
+        torch.testing.assert_close(packed, batched, rtol=1e-2, atol=1e-3)
