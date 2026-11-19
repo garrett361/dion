@@ -78,7 +78,9 @@ def make_parameters(mesh):
     return params
 
 
-def make_eager_muon(params, mesh):
+def make_eager_muon(
+    params, mesh, newton_schulz_func=zeropower_via_newtonschulz5._torchdynamo_orig_callable
+):
     groups, start = [], 0
     for options, matrices in GROUPS:
         groups.append(dict(options, params=params[start : start + len(matrices)]))
@@ -96,7 +98,7 @@ def make_eager_muon(params, mesh):
         distributed_mesh=mesh["dp_shard"],
         world_mesh=mesh,
         fsdp_mesh_dim=mesh.ndim - 1,
-        newton_schulz_func=zeropower_via_newtonschulz5._torchdynamo_orig_callable,
+        newton_schulz_func=newton_schulz_func,
     )
 
 
@@ -138,7 +140,7 @@ def test_packed_matches_batched_bitwise(world_size, replicas, matrices_per_rank,
         packed.step()
         batched.step()
 
-    assert sum(len(plan.owners) for plan in packed._packed_plans.values()) == PACKED_MATRICES
+    assert sum(len(plan.owners) for _, plan in packed._packed_plans.values()) == PACKED_MATRICES
     assert not batched._packed_plans
     for packed_param, batched_param, before in zip(packed_params, batched_params, start):
         assert set(packed.state[packed_param]) == set(batched.state[batched_param]) == {"momentum"}
@@ -153,3 +155,32 @@ def test_packed_matches_batched_bitwise(world_size, replicas, matrices_per_rank,
         )
         if before.numel():
             assert not torch.equal(packed_param.to_local(), before)
+
+
+def float32_newton_schulz(G, epsilon):
+    return zeropower_via_newtonschulz5._torchdynamo_orig_callable(G, epsilon).float()
+
+
+def test_packed_tolerates_float32_newton_schulz(world_size, monkeypatch):
+    """
+    A custom Newton-Schulz function may return float32. The packed path casts its result to the
+    update's bfloat16 before the return exchange, so it stays within bfloat16 rounding of the
+    batched path, which applies the float32 result.
+    """
+    mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_shard",))
+    packed_params, batched_params = make_parameters(mesh), make_parameters(mesh)
+    packed = make_eager_muon(packed_params, mesh, float32_newton_schulz)
+    batched = make_eager_muon(batched_params, mesh, float32_newton_schulz)
+    monkeypatch.setattr(batched, "_pack_sharded_matrices", False)
+    generator = torch.Generator().manual_seed(1)
+    for packed_param, batched_param in zip(packed_params, batched_params):
+        grad = torch.randn(packed_param.shape, generator=generator)
+        grad = grad.to(device="cuda", dtype=packed_param.dtype)
+        packed_param.grad = distribute_tensor(grad, mesh, packed_param.placements)
+        batched_param.grad = distribute_tensor(grad, mesh, batched_param.placements)
+    packed.step()
+    batched.step()
+    for packed_param, batched_param in zip(packed_params, batched_params):
+        torch.testing.assert_close(
+            packed_param.to_local(), batched_param.to_local(), rtol=1e-2, atol=1e-3
+        )

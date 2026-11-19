@@ -182,7 +182,7 @@ class Muon(Optimizer):
             )
 
         self._matrix_shard_dims: Dict[tuple, Tuple[Optional[int], bool]] = {}
-        self._packed_plans: Dict[tuple, PackedPlan] = {}
+        self._packed_plans: Dict[tuple, Tuple[Tuple[Tensor, ...], PackedPlan]] = {}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -310,17 +310,15 @@ class Muon(Optimizer):
             for bucket in exchange_buckets(packed, keys, world_size):
                 params = [packed[i] for i in bucket]
                 partitions = [self._matrix_partitions.get(p) for p in params]
-                plan_key = (tuple(id(p) for p in params), world_size)
-                if plan_key not in self._packed_plans:
-                    self._packed_plans[plan_key] = make_plan(
-                        params, [shard_dims[i] for i in bucket], partitions, world_size
-                    )
+                plan = self._get_packed_plan(
+                    params, [shard_dims[i] for i in bucket], partitions, world_size
+                )
                 yield AsyncTask(
                     muon_update_packed_async(
                         X=params,
                         G=[p.grad for p in params],
                         M=[self._get_or_initialize_state(p, algo_name)["momentum"] for p in params],
-                        plan=self._packed_plans[plan_key],
+                        plan=plan,
                         partitions=partitions,
                         lr=lr,
                         momentum=mu,
@@ -387,6 +385,23 @@ class Muon(Optimizer):
                         partitions=partitions,
                     )
                 )
+
+    def _get_packed_plan(
+        self,
+        params: List[Tensor],
+        shard_dims: List[int],
+        partitions: List[Optional[Tuple[int, ...]]],
+        world_size: int,
+    ) -> PackedPlan:
+        """
+        The cached owner plan of a bucket, rebuilt unless it was made for these very tensors.
+        """
+        key = (tuple(id(p) for p in params), world_size)
+        cached = self._packed_plans.get(key)
+        if cached is None or any(a is not b for a, b in zip(cached[0], params)):
+            cached = (tuple(params), make_plan(params, shard_dims, partitions, world_size))
+            self._packed_plans[key] = cached
+        return cached[1]
 
     def _split_packed_params(
         self,
@@ -829,7 +844,8 @@ def muon_update_packed_async(
             flatten=flatten,
             epsilon=epsilon,
         )
-        matrix = pad_dim(matrix, dim, padded * world_size)
+        # The return exchange is sized in the update's dtype on every rank, owners or not
+        matrix = pad_dim(matrix.to(dtype=U[index].dtype), dim, padded * world_size)
         back.append(
             [
                 shard.narrow(dim, 0, plan.shard_sizes[index][rank]).contiguous()
